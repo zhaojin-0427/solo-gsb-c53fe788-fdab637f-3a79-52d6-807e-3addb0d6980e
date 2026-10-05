@@ -828,6 +828,219 @@ def test_cycle_verdict_is_deterministic_across_export(client):
     assert main["call_coverage"]["baseline"]["rows"] == d["rows"]
 
 
+# ============================================================== 同层属性 × 组合交集裁决
+def _same_level_schema(kind, branches=None):
+    """同一节点同时含自引用 properties.child 与 oneOf/anyOf。"""
+    return {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+            "id": {"type": "integer"},
+            "child": {"$ref": "#/components/schemas/Node"},
+        },
+        kind: branches if branches is not None else [
+            {"type": "object", "required": ["kind"],
+             "additionalProperties": False,
+             "properties": {"kind": {"const": "n"}, "id": {"type": "integer"}}},
+            {"$ref": "#/components/schemas/Node"},
+        ],
+    }
+
+
+def _same_level_doc(kind, branches=None):
+    spec = _spec({"/nodes": {"post": {
+        "requestBody": {"content": {"application/json": {
+            "schema": _same_level_schema(kind, branches)}}},
+        "responses": {"200": {"description": "d"}}}}})
+    spec.update(_RECURSIVE_COMPONENTS)
+    return spec
+
+
+def _same_level_call(body):
+    return {"method": "POST", "path": "/nodes",
+            "request": {"media_type": "application/json", "body": body},
+            "response": {"status": 200}}
+
+
+def test_same_level_child_pending_anyof_pass_is_undetermined(client):
+    # 回归（核心）：取值的 child 已使本层属性校验待定，anyOf 一支对整个
+    # 载荷确定通过（组合结论 PASS）也不得直接判 covered / 增加覆盖格——
+    # 交集裁决为无法判定。
+    branches = [
+        {"type": "object"},  # 对整个载荷确定通过
+        {"$ref": "#/components/schemas/Node"},  # 随 child 触达循环 → 待定
+    ]
+    aid = _analysis_from_docs(
+        client, _same_level_doc("anyOf", branches))
+    doc = _upload(client, aid, "baseline", [
+        _same_level_call({"id": 1, "child": {"id": 2, "child": {"id": 3}}}),
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert row["cell"] is None
+    assert any("循环引用" in x and "components/schemas/Node" in x
+               for x in row["reasons"])
+    assert doc["summary"]["calls_undetermined"] == 1
+    assert doc["summary"]["cells_covered"] == 0
+    assert doc["summary"]["calls_covered"] == 0
+    op = doc["operations"][0]
+    assert {c["key"] for c in op["gaps"]} == {"200|(no content)"}
+
+
+def test_same_level_child_pending_oneof_pass_is_undetermined(client):
+    # 同层 child 待定 + oneOf 恰好一个分支对载荷确定通过 → 仍无法判定
+    branches = [
+        {"type": "object"},  # 确定通过
+        {"type": "object", "required": ["missing"],
+         "properties": {"missing": {"const": "x"}}},  # 确定失败
+    ]
+    aid = _analysis_from_docs(
+        client, _same_level_doc("oneOf", branches))
+    doc = _upload(client, aid, "baseline", [
+        _same_level_call({"id": 1, "child": {"id": 2, "child": {"id": 3}}}),
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("循环引用" in x and "components/schemas/Node" in x
+               for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_same_level_known_failure_dominates_combinator_pass(client):
+    # 本层已知约束失败（child 内 id 类型错）即使 anyOf 一支对载荷确定通过
+    # 也判失败——失败优先于组合结论。
+    branches = [
+        {"type": "object"},  # 组合层面确定通过
+        {"$ref": "#/components/schemas/Node"},
+    ]
+    aid = _analysis_from_docs(
+        client, _same_level_doc("anyOf", branches))
+    doc = _upload(client, aid, "baseline", [
+        _same_level_call({"id": 1, "child": {"id": "bad"}}),
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "validation_failed"
+    assert any("/child/id" in x for x in doc["rows"][0]["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_same_level_combinator_failure_dominates_pending(client):
+    # 组合整体确定失败（oneOf 无任何分支通过）时，即使本层 child 待定也失败
+    branches = [
+        {"type": "object", "required": ["nope"],
+         "properties": {"nope": {"const": "x"}}},
+        {"type": "object", "required": ["also"],
+         "properties": {"also": {"const": "y"}}},
+    ]
+    aid = _analysis_from_docs(
+        client, _same_level_doc("oneOf", branches))
+    doc = _upload(client, aid, "baseline", [
+        _same_level_call({"id": 1, "child": {"id": 2, "child": {"id": 3}}}),
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "validation_failed"
+    assert any("不满足 oneOf" in x for x in doc["rows"][0]["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_same_level_optional_child_absent_does_not_block(client):
+    # 未触达的可选 child：anyOf 分支确定通过 → 正常覆盖；
+    # oneOf 在两个分支都确定通过时仍按「恰好一个」判失败。
+    aid = _analysis_from_docs(client, _same_level_doc("anyOf"))
+    doc = _upload(client, aid, "baseline", [
+        _same_level_call({"id": 1}),
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+    branches = [
+        {"type": "object", "required": ["id"],
+         "properties": {"id": {"type": "integer"}}},
+        {"$ref": "#/components/schemas/Node"},
+    ]
+    aid = _analysis_from_docs(
+        client, _same_level_doc("oneOf", branches))
+    doc = _upload(client, aid, "baseline", [
+        _same_level_call({"id": 1}),
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "validation_failed"
+    assert any("恰好一个" in x for x in doc["rows"][0]["reasons"])
+
+
+def test_same_level_unsupported_keyword_pending_blocks_anyof_pass(client):
+    # 同层未支持关键字（pattern，与取值字符串类型相关）待定，
+    # 即使 anyOf 一支确定通过也判无法判定并报告模式位置。
+    schema = {"type": "string", "pattern": "^x",
+              "anyOf": [{"const": "abc"}, {"const": "xyz"}]}
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json", "body": "abc"},
+         "response": {"status": 200}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("pattern" in x and "/schema/pattern" in x
+               for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+    # 保存查询与确定性导出逐行一致
+    got = client.get(
+        f"/api/analyses/{aid}/coverage/baseline").json()
+    assert got["rows"] == doc["rows"]
+    exported = json.loads(client.get(
+        f"/api/analyses/{aid}/coverage/baseline/export").content)
+    assert exported["rows"] == doc["rows"]
+    assert exported["operations"] == doc["operations"]
+
+
+def test_same_level_pending_on_candidate_side(client):
+    # 候选侧同样按交集裁决
+    aid = _analysis_from_docs(client, _same_level_doc("anyOf"))
+    doc = _upload(client, aid, "candidate", [
+        _same_level_call({"id": 1, "child": {"id": 2, "child": {"id": 3}}}),
+    ]).json()
+    assert doc["analysis_side"] == "candidate"
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_same_level_pending_verdict_consistent_in_main_export(client):
+    # 同层交集待定结论：页面/API/保存查询/两侧确定性导出逐行一致
+    aid = _analysis_from_docs(client, _same_level_doc("anyOf"))
+    doc = _upload(client, aid, "baseline", [
+        _same_level_call({"id": 1, "child": {"id": 2, "child": {"id": 3}}}),
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert doc["summary"]["cells_covered"] == 0
+
+    # 保存后重新查询：逐行结论、汇总、缺口一致
+    got = client.get(
+        f"/api/analyses/{aid}/coverage/baseline").json()
+    assert got["rows"] == doc["rows"]
+    assert got["summary"] == doc["summary"]
+    assert got["operations"] == doc["operations"]
+    avail = client.get(f"/api/analyses/{aid}/coverage").json()
+    sides = {s["side"]: s for s in avail["sides"]}
+    assert sides["baseline"]["available"] is True
+    assert sides["baseline"]["summary"]["calls_undetermined"] == 1
+
+    # 侧导出
+    side_export = json.loads(client.get(
+        f"/api/analyses/{aid}/coverage/baseline/export").content)
+    assert side_export["rows"] == doc["rows"]
+    assert side_export["summary"] == doc["summary"]
+    assert side_export["operations"] == doc["operations"]
+
+    # 主报告导出内嵌同一份确定性结论
+    main = json.loads(client.get(
+        f"/api/analyses/{aid}/export").content)
+    embedded = main["call_coverage"]["baseline"]
+    assert embedded["rows"] == doc["rows"]
+    assert embedded["summary"] == doc["summary"]
+    assert embedded["operations"] == doc["operations"]
+
+
 # ============================================================== HTTP surface
 def test_coverage_404_unknown_analysis(client):
     r = _upload(client, "nope", "baseline", [

@@ -15,7 +15,7 @@ the row is undetermined with the schema location reported.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from .schemagraph import SchemaNode, UNSET
 
@@ -120,6 +120,15 @@ def assess(node: SchemaNode, value: Any, *, reenter=None) -> Assessment:
     ``reenter(file, pointer) -> SchemaNode`` rebuilds the full node at a
     cycle-marker site; when omitted the cycle is reported as PENDING without
     re-expansion.
+
+    Same-level facets and ``oneOf``/``anyOf`` are adjudicated as an
+    **intersection**: a known facet failure (or the combinator failing
+    outright) yields FAIL; otherwise facet-level PENDING — a value whose
+    ``child`` reaches a recursive node, or an unsupported keyword relevant
+    to the value type — stays PENDING with locations reported, *even when a
+    combinator branch already passes* (e.g. ``anyOf`` with one definite
+    pass). The combinator itself still follows exactly-one (``oneOf``) /
+    at-least-one (``anyOf``) semantics.
     """
     return _assess(node, value, path="", depth=0,
                    mode="coverage", reenter=reenter, visited=frozenset(),
@@ -326,21 +335,39 @@ def _assess(node: SchemaNode, value: Any, *, path: str, depth: int,
                 errors.append(f"{path or '#'}: 不满足 anyOf 的任何分支")
         return Assessment(TRI_FAIL if errors else TRI_PASS, errors, hits)
 
-    # coverage 三态
+    # coverage 三态：按**节点约束的交集**裁决本层 facet 与组合结果——
+    # 本层已知失败（或组合整体确定失败）→ FAIL；否则本层待定（取值沿
+    # properties.child 等触达循环 / 不可解析节点 / 未支持关键字）即使
+    # oneOf/anyOf 组合确定通过，也必须保留 PENDING 并报告模式位置，不得
+    # 直接把组合结论当作节点结论而误计覆盖格。
     facet_failed = bool(errors) or child_state == TRI_FAIL
+    facet_pending = child_state == TRI_PENDING or bool(hits)
+
+    combinator: Optional[Assessment] = None
+    if node.one_of:
+        combinator = _combine(node.one_of, value, path,
+                              reenter, visited, reentries, exactly_one=True)
+    elif node.any_of:
+        combinator = _combine(node.any_of, value, path,
+                              reenter, visited, reentries, exactly_one=False)
+
+    if combinator is not None:
+        for h in combinator.hits:
+            if h not in hits:
+                hits.append(h)
+        all_errors = errors + [e for e in combinator.errors if e not in errors]
+        # 组合整体确定失败 → 节点确定失败（本层待定也无法挽回）
+        if facet_failed or combinator.state == TRI_FAIL:
+            return Assessment(TRI_FAIL, all_errors, hits)
+        # 本层已知约束待定：即使组合确定通过（anyOf 至少一个 / oneOf
+        # 恰好一个），交集仍无法定论
+        if facet_pending or combinator.state == TRI_PENDING:
+            return Assessment(TRI_PENDING, all_errors, hits)
+        return Assessment(TRI_PASS, all_errors, hits)
+
     if facet_failed:
         return Assessment(TRI_FAIL, errors, hits)
-
-    if node.one_of:
-        return _combine(node.one_of, value, path,
-                        reenter, visited, reentries, exactly_one=True)
-    if node.any_of:
-        return _combine(node.any_of, value, path,
-                        reenter, visited, reentries, exactly_one=False)
-
-    if errors:
-        return Assessment(TRI_FAIL, errors, hits)
-    if child_state == TRI_PENDING or hits:
+    if facet_pending:
         return Assessment(TRI_PENDING, errors, hits)
     return Assessment(TRI_PASS, errors, hits)
 
