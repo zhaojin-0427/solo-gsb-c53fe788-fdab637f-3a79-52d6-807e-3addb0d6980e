@@ -813,6 +813,152 @@ def test_anyof_pass_plus_cycle_pending_covers(client):
     assert doc["summary"]["cells_covered"] == 1
 
 
+def test_same_level_property_pending_with_oneof_not_covered(client):
+    # 回归（同层属性 + 组合约束的交集裁决）：schema 同时含自引用的
+    # properties.child 与 oneOf——取值触达 child 已使本层属性校验待定，
+    # 即使组合分支恰好一个确定通过，也必须报告模式位置、判无法判定，
+    # 且不增加覆盖格（旧实现直接返回 covered 并误计一格）。
+    node = {
+        "type": "object", "required": ["id"],
+        "properties": {
+            "id": {"type": "integer"},
+            "child": {"$ref": "#/components/schemas/Node"}},
+        # branch0 需要 kind；branch1 只需 id → 下面的取值只过 branch1
+        "oneOf": [
+            {"required": ["kind"],
+             "properties": {"kind": {"const": "a"}}},
+            {"required": ["id"]}]}
+    spec = _spec({"/nodes": {"get": {"responses": {"200": {
+        "description": "ok",
+        "content": {"application/json": {"schema": {
+            "$ref": "#/components/schemas/Node"}}}}}}}})
+    spec["components"] = {"schemas": {"Node": node}}
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        _rec_call({"id": 1, "child": {"id": 2}}),    # child 触达自引用
+        _rec_call({"id": 1}),                        # 未触达可选 child → 覆盖
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert row["cell"] is None
+    assert any("循环引用" in x and "components/schemas/Node" in x
+               for x in row["reasons"])
+    assert doc["rows"][1]["outcome"] == "covered"
+    assert doc["summary"]["calls_undetermined"] == 1
+    assert doc["summary"]["calls_covered"] == 1
+    assert doc["summary"]["cells_covered"] == 1
+    op = doc["operations"][0]
+    assert {c["key"] for c in op["gaps"]} == set()
+    # 保存查询与确定性导出给出同一逐行结论
+    got = client.get(
+        f"/api/analyses/{aid}/coverage/baseline").json()
+    assert got["rows"] == doc["rows"]
+    exported = json.loads(client.get(
+        f"/api/analyses/{aid}/coverage/baseline/export").content)
+    assert exported["rows"] == doc["rows"]
+    assert exported["summary"] == doc["summary"]
+    main = json.loads(client.get(
+        f"/api/analyses/{aid}/export").content)
+    assert main["call_coverage"]["baseline"]["rows"] == doc["rows"]
+
+
+def test_same_level_property_pending_with_anyof_not_covered(client):
+    # anyOf「至少一个」在此节点确定通过，也不能盖过同层属性的待定：
+    # 交集裁决下仍判无法判定、不计格。
+    node = {
+        "type": "object", "required": ["id"],
+        "properties": {
+            "id": {"type": "integer"},
+            "child": {"$ref": "#/components/schemas/Node"}},
+        "anyOf": [{"required": ["id"]}]}
+    spec = _spec({"/nodes": {"get": {"responses": {"200": {
+        "description": "ok",
+        "content": {"application/json": {"schema": {
+            "$ref": "#/components/schemas/Node"}}}}}}}})
+    spec["components"] = {"schemas": {"Node": node}}
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        _rec_call({"id": 1, "child": {"id": 2}}),
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert doc["rows"][0]["cell"] is None
+    assert any("循环引用" in x and "components/schemas/Node" in x
+               for x in doc["rows"][0]["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_same_level_unsupported_keyword_blocks_oneof_pass(client):
+    # 同层未支持关键字（pattern）使属性侧待定；oneOf 恰好一个分支确定通过
+    # 仍须判无法判定并列出关键字与位置。
+    schema = {
+        "type": "object",
+        "properties": {"v": {"type": "string", "pattern": "^a"}},
+        "oneOf": [{"required": ["v"]}, {"required": ["zz"]}]}
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"v": "abc"}},
+         "response": {"status": 200}},
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert any("pattern" in x and "properties/v" in x
+               for x in doc["rows"][0]["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_same_level_known_failure_outranks_combo_pending(client):
+    # 本层已知失败（缺必填 id）优先判失败：即使 oneOf 的另一分支因 pattern
+    # 待定，失败也不可能被待定因素挽回——不报告无法判定、不泄漏 pattern 命中。
+    schema = {
+        "type": "object", "required": ["id"],
+        "properties": {"id": {"type": "integer"},
+                       "v": {"type": "string", "pattern": "^a"}},
+        "oneOf": [{"required": ["v"]}, {"type": "object"}]}
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "POST", "path": "/p",
+         "request": {"media_type": "application/json",
+                     "body": {"v": "abc"}},
+         "response": {"status": 200}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "validation_failed"
+    assert any("缺少必填属性 'id'" in x for x in row["reasons"])
+    assert not any("pattern" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_recursive_child_known_fail_with_same_level_oneof_fails(client):
+    # 递归 child 深处的已知失败优先；同层 oneOf 的一个分支确定通过不翻案。
+    node = {
+        "type": "object", "required": ["id"],
+        "properties": {
+            "id": {"type": "integer"},
+            "child": {"$ref": "#/components/schemas/Node"}},
+        "oneOf": [{"required": ["id"]}, {"required": ["zz"]}]}
+    spec = _spec({"/nodes": {"get": {"responses": {"200": {
+        "description": "ok",
+        "content": {"application/json": {"schema": {
+            "$ref": "#/components/schemas/Node"}}}}}}}})
+    spec["components"] = {"schemas": {"Node": node}}
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        _rec_call({"id": 1, "child": {"id": "bad"}}),
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "validation_failed"
+    assert any("/child/id" in x for x in row["reasons"])
+    assert not any("循环引用" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
 def test_cycle_verdict_is_deterministic_across_export(client):
     aid = _analysis_from_docs(client, _rec_doc())
     d = _upload(client, aid, "baseline", [

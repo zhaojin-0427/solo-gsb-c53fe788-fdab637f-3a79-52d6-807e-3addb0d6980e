@@ -12,6 +12,15 @@ walks *along the actual value* and returns a three-state verdict
 mutually-referential node is never optimistically counted as covered —
 known constraints failing inside the recursive part still fail, otherwise
 the row is undetermined with the schema location reported.
+
+At a node that carries **both** same-level constraints (properties /
+items / unsupported keywords / …) **and** ``oneOf``/``anyOf``, the verdict
+is the **intersection** of the two: a known failure at this level, or a
+combination that is definitively unsatisfied, fails; otherwise a pending
+same-level constraint is reported as undetermined *even when the
+combination definitely passes* (an optional, untouched ``child`` never
+blocks coverage). The combinators themselves keep their own rules —
+``oneOf`` requires exactly one passing branch, ``anyOf`` at least one.
 """
 from __future__ import annotations
 
@@ -190,18 +199,24 @@ def _assess(node: SchemaNode, value: Any, *, path: str, depth: int,
     child_state = TRI_PASS
 
     def absorb(result: Assessment) -> None:
-        """Fold a child verdict in: FAIL dominates; otherwise PENDING sticks;
-        hits/errors are collected for location reporting."""
+        """Fold a child verdict in: FAIL dominates; otherwise PENDING sticks.
+
+        Only a genuinely PENDING child contributes pending ``hits`` — a FAIL
+        branch may have *incidentally* reached an unsupported keyword or a
+        cycle, but its known failure already settles the verdict, so those
+        hits must not leak back as an undecided factor at the parent.
+        """
         nonlocal child_state
-        for h in result.hits:
-            if h not in hits:
-                hits.append(h)
-        if result.errors:
-            errors.extend(result.errors)
         if result.state == TRI_FAIL:
             child_state = TRI_FAIL
-        elif result.state == TRI_PENDING and child_state != TRI_FAIL:
-            child_state = TRI_PENDING
+            errors.extend(result.errors)
+            return
+        if result.state == TRI_PENDING:
+            for h in result.hits:
+                if h not in hits:
+                    hits.append(h)
+            if child_state != TRI_FAIL:
+                child_state = TRI_PENDING
 
     if not type_failed and value is not None:
         if node.enum is not None and not any(
@@ -326,23 +341,45 @@ def _assess(node: SchemaNode, value: Any, *, path: str, depth: int,
                 errors.append(f"{path or '#'}: 不满足 anyOf 的任何分支")
         return Assessment(TRI_FAIL if errors else TRI_PASS, errors, hits)
 
-    # coverage 三态
+    # coverage 三态：节点自身约束（属性 / 数组元素 / 未支持关键字 /
+    # 枚举边界……）与组合结果取**交集**统一裁决：
+    #   1. 本层已知失败（属性校验待定之外的确定错误）或组合整体确定失败
+    #      → FAIL（待定因素不可能挽回一个已知失败）；
+    #   2. 否则本层仍有待定约束（取值触达循环 / 不可解析节点 / 未支持
+    #      关键字），即使组合确定通过，也必须报 PENDING 并给出模式位置，
+    #      不计覆盖格——同层约束与组合是 AND 关系；
+    #   3. 组合本身的三态按 oneOf「恰好一个」/ anyOf「至少一个」裁决。
     facet_failed = bool(errors) or child_state == TRI_FAIL
-    if facet_failed:
-        return Assessment(TRI_FAIL, errors, hits)
-
+    facet_pending = child_state == TRI_PENDING or bool(hits)
     if node.one_of:
-        return _combine(node.one_of, value, path,
-                        reenter, visited, reentries, exactly_one=True)
-    if node.any_of:
-        return _combine(node.any_of, value, path,
-                        reenter, visited, reentries, exactly_one=False)
+        combo = _combine(node.one_of, value, path,
+                         reenter, visited, reentries, exactly_one=True)
+    elif node.any_of:
+        combo = _combine(node.any_of, value, path,
+                         reenter, visited, reentries, exactly_one=False)
+    else:
+        combo = None
 
-    if errors:
-        return Assessment(TRI_FAIL, errors, hits)
-    if child_state == TRI_PENDING or hits:
-        return Assessment(TRI_PENDING, errors, hits)
-    return Assessment(TRI_PASS, errors, hits)
+    if facet_failed:
+        # 本层已知失败优先：组合无需（也不能）翻案；失败分支里附带的
+        # 未支持/循环命中与失败结论无关，不按待定上报。
+        if combo is not None:
+            errors = errors + combo.errors
+        return Assessment(TRI_FAIL, errors, [])
+    if combo is not None and combo.state == TRI_FAIL:
+        # 组合整体确定失败（oneOf 多支通过 / 全支失败，anyOf 全支失败）；
+        # 本层属性侧若另有已知错误，一并保留在前面。
+        return Assessment(TRI_FAIL, errors + combo.errors, [])
+    if facet_pending or (combo is not None and combo.state == TRI_PENDING):
+        # 同层约束待定即不能计通过，哪怕组合已经确定通过；模式位置 /
+        # 关键字随 hits 一并列明。
+        all_hits = hits
+        if combo is not None:
+            for h in combo.hits:
+                if h not in all_hits:
+                    all_hits.append(h)
+        return Assessment(TRI_PENDING, [], all_hits)
+    return Assessment(TRI_PASS, [], [])
 
 
 def _revisit(loc, value, path, reenter, visited, reentries):
@@ -371,10 +408,11 @@ def _revisit(loc, value, path, reenter, visited, reentries):
     result = _assess(target, value, path=path, depth=0,
                      mode="coverage", reenter=reenter, visited=visited,
                      reentries=reentries + 1, _skip_self=True)
-    hits = [cycle_hit] + [h for h in result.hits if h != cycle_hit]
-    # 同一分支的已知失败优先；否则触达循环即为待定（带模式位置）
+    # 同一分支的已知失败优先（失败即定论，附带命中的循环/未支持关键字
+    # 不再作为待定因素上报）；否则触达循环即为待定（带模式位置）。
     if result.state == TRI_FAIL:
-        return Assessment(TRI_FAIL, result.errors, hits)
+        return Assessment(TRI_FAIL, result.errors, [])
+    hits = [cycle_hit] + [h for h in result.hits if h != cycle_hit]
     return Assessment(TRI_PENDING, result.errors, hits)
 
 
@@ -405,9 +443,12 @@ def _combine(branches, value, path, reenter, visited, reentries,
                     mode="coverage", reenter=reenter, visited=visited,
                     reentries=reentries)
         states.append(r.state)
-        for h in r.hits:
-            if h not in hits:
-                hits.append(h)
+        # 只有「待定」分支保留其未决命中；确定失败分支附带命中的循环 /
+        # 未支持关键字不影响其失败结论，也不应污染待定上报。
+        if r.state == TRI_PENDING:
+            for h in r.hits:
+                if h not in hits:
+                    hits.append(h)
         errors.extend(r.errors)
     n_pass = states.count(TRI_PASS)
     n_pending = states.count(TRI_PENDING)
